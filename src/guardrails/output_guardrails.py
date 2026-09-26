@@ -5,7 +5,6 @@ Checkpoint 2 — Output Guardrails
   - LLM-as-Judge                          ← optional (không chấm)
 """
 import re
-import textwrap
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +12,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
 
 
 # ============================================================
@@ -36,21 +36,27 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    response = response or ""
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    patterns = {
+        "Vietnamese phone number": r"(?<!\d)(?:0(?:[\s().-]*\d){9,10}|\+84(?:[\s().-]*\d){9})(?!\d)",
+        "email address": r"\b[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+\b",
+        "national ID": r"(?<!\d)\d{12}(?!\d)|(?<!\d)\d{9}(?!\d)",
+        "API key": r"\bsk-[A-Za-z0-9_-]{4,}\b",
+        "API key assignment": r"\bapi[_\s-]*key\s*[:=]\s*[^\s,;]+",
+        "password": r"\b(?:admin\s+)?password\b(?:\s*(?:is|:|=)\s*|\s+)[^\s,;.!?]+",
+        "database host": r"\bdb\.vinbank\.internal(?::\d+)?\b",
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    # Include exact protected demo values loaded from the lab's protected file.
+    for index, secret in enumerate(DEMO_SECRETS):
+        if secret and len(secret) >= 4:
+            patterns[f"protected demo secret {index + 1}"] = re.escape(secret)
+
+    for name, pattern in patterns.items():
+        matches = list(re.finditer(pattern, response, re.IGNORECASE))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -89,7 +95,8 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
+# LLM-as-Judge is optional for this checkpoint. Keep it disabled by default;
+# the deterministic content filter below is the required protection.
 # Hint:
 # safety_judge_agent = llm_agent.LlmAgent(
 #     model="gemini-3.5-flash",
@@ -172,16 +179,31 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        guarded_text = filtered["redacted"]
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=guarded_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(guarded_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I can't provide that response because it may be "
+                                "unsafe. I can help with VinBank banking questions."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
